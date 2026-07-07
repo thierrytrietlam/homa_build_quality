@@ -23,23 +23,34 @@ VERSIONS = ("10.2", "11.0")  # the two builds under test; 11.0.1 handled in sect
 MAX_HORIZON = 7              # brief: data beyond cohort day 7 is out of scope
 
 con = duckdb.connect()
+# Load CSVs as DuckDB views.
 con.execute(f"""
     CREATE VIEW act  AS SELECT * FROM read_csv_auto('{(ROOT / 'data' / 'user_activity.csv').as_posix()}', header=true);
     CREATE VIEW prog AS SELECT * FROM read_csv_auto('{(ROOT / 'data' / 'progression.csv').as_posix()}',  header=true);
 """)
 
+# Get extract date and first 11.0 install date.
 EXTRACT, WIN_START = con.execute("""
     SELECT MAX(d_install_date)::DATE,
            (MIN(d_install_date) FILTER (WHERE s_app_version = '11.0'))::DATE
     FROM act
 """).fetchone()
+
+# Keep only cohorts mature through D7.
 WIN_END = con.execute(f"SELECT DATE '{EXTRACT}' - {MAX_HORIZON}").fetchone()[0]
+
+# Ensure the dataset matches the case study extract date.
 assert str(EXTRACT) == "2026-05-03", "extract date drifted from the brief"
 
+# Store the analysis window for reporting.
 M = {"window": {"extract_date": str(EXTRACT), "win_start": str(WIN_START),
                 "win_end": str(WIN_END),
                 "rule": "win_start = first 11.0 install; win_end = extract - 7 so every cohort is mature to D7"}}
+
+# Filter to the comparable cohort window.
 WIN = f"d_install_date BETWEEN DATE '{WIN_START}' AND DATE '{WIN_END}'"
+
+# Restrict analysis to the two builds under evaluation.
 V2 = "s_app_version IN ('10.2', '11.0')"
 
 
@@ -56,26 +67,45 @@ def rule(title):
 # --------------------------------------------------------------------------- #
 rule("1. PROFILE AND INTEGRITY (before any KPI)")
 
+# Profile each app version.
 prof = q("""
     SELECT s_app_version, COUNT(*) AS rows_,
            MIN(d_install_date)::DATE AS first_install, MAX(d_install_date)::DATE AS last_install,
            SUM(i_active_users) FILTER (WHERE i_cohort_groups = 0) AS d0_users
     FROM act GROUP BY 1 ORDER BY 1
 """)
+
+# Print the profile.
 print(prof.to_string(index=False))
+
+# Save version metadata.
 M["versions"] = prof.astype(str).to_dict("records")
 
 integrity = q(f"""
     SELECT
+      -- Total progression rows.
       (SELECT COUNT(*) FROM prog)                                                          AS prog_rows,
+
+      -- Rows where the started = completed + failed identity does not hold.
       (SELECT COUNT(*) FROM prog WHERE i_level_started <> i_level_completed + i_level_failed) AS identity_breaks,
-      (SELECT COUNT(*) FROM prog WHERE LEAST(i_level_started, i_level_completed, i_level_failed, i_users, f_play_time) < 0)
+
+      -- Rows with negative values.
+      (SELECT COUNT(*) FROM prog WHERE LEAST(i_level_started, i_level_completed, i_level_failed, i_users, 
+      f_play_time) < 0)
         + (SELECT COUNT(*) FROM act WHERE LEAST(i_active_users, i_count_sessions, f_playtime) < 0) AS negatives,
+
+      -- Duplicate rows in the act table.
       (SELECT COUNT(*) FROM (SELECT 1 FROM act  GROUP BY d_install_date, s_app_version, s_country,
               s_acquisition_network, s_installing_pckg_group, i_cohort_groups HAVING COUNT(*) > 1))   AS dup_act,
+
+      -- Duplicate rows in the prog table.
       (SELECT COUNT(*) FROM (SELECT 1 FROM prog GROUP BY d_install_date, s_app_version, s_country,
               s_acquisition_network, s_installing_pckg_group, i_cohort_groups, i_level HAVING COUNT(*) > 1)) AS dup_prog,
+
+      -- Rows beyond the extract date.
       (SELECT COUNT(*) FROM act WHERE d_install_date + i_cohort_groups * INTERVAL 1 DAY > DATE '{EXTRACT}') AS rows_beyond_extract,
+
+      -- Rows with duplicate cohort cells.
       (SELECT COUNT(*) FROM (
           SELECT SUM(i_active_users) FILTER (WHERE i_cohort_groups = 0) AS d0,
                  MAX(i_active_users) FILTER (WHERE i_cohort_groups > 0) AS later
@@ -88,12 +118,15 @@ assert int(integrity.identity_breaks[0]) == 0
 
 integrity2 = q(f"""
     SELECT
+      -- Rows in prog without a corresponding row in act.
       (SELECT COUNT(*) FROM (SELECT DISTINCT d_install_date, s_app_version, s_country, s_acquisition_network,
               s_installing_pckg_group, i_cohort_groups FROM prog) p
         LEFT JOIN (SELECT DISTINCT d_install_date, s_app_version, s_country, s_acquisition_network,
               s_installing_pckg_group, i_cohort_groups FROM act) a
         USING (d_install_date, s_app_version, s_country, s_acquisition_network, s_installing_pckg_group, i_cohort_groups)
         WHERE a.d_install_date IS NULL)                                                     AS prog_cells_without_act,
+
+      -- Rows in act without a corresponding row in prog.
       (SELECT COUNT(*) FROM (
           WITH agg AS (SELECT s_app_version v, d_install_date::DATE d, i_cohort_groups cd
                        FROM act WHERE {V2} GROUP BY 1, 2, 3),
@@ -102,12 +135,21 @@ integrity2 = q(f"""
                      WHERE gs.cd <= LEAST(7, DATE '{EXTRACT}' - d))
           SELECT 1 FROM expect e LEFT JOIN agg a ON a.v = e.v AND a.d = e.d AND a.cd = e.cd
           WHERE a.v IS NULL))                                                               AS missing_version_day_rows,
+
+      -- Rows where sessions < actives.
       (SELECT COUNT(*) FROM act WHERE i_count_sessions < i_active_users)                    AS cells_sessions_lt_actives,
+
+      -- Rows where playtime > 24h.
       (SELECT COUNT(*) FROM act WHERE f_playtime > i_active_users * 86400.0)                AS cells_playtime_gt_24h,
+
+      -- Rows where users > starts.
       (SELECT COUNT(*) FROM prog WHERE i_users > i_level_started)                           AS cells_users_gt_starts,
+
+      -- Install date gaps.
       (SELECT SUM((sp - n)::INT) FROM (SELECT (MAX(d) - MIN(d) + 1) sp, COUNT(*) n FROM
           (SELECT DISTINCT s_app_version, d_install_date::DATE d FROM act) GROUP BY s_app_version)) AS install_date_gaps
 """)
+
 print(integrity2.to_string(index=False))
 M["integrity2"] = integrity2.iloc[0].astype(int).to_dict()
 

@@ -1,0 +1,16 @@
+# Draft and scratch work. Kept local, not part of the submission.
+draft/
+
+# Python bytecode cache.
+__pycache__/
+*.pyc
+
+# Local report intermediates.
+outputs/_report.html
+outputs/_executive_report.html
+
+# Local data files.
+data/
+
+# Local markdown
+jd_homa.md
