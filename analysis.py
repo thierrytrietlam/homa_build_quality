@@ -149,20 +149,27 @@ integrity2 = q(f"""
       (SELECT SUM((sp - n)::INT) FROM (SELECT (MAX(d) - MIN(d) + 1) sp, COUNT(*) n FROM
           (SELECT DISTINCT s_app_version, d_install_date::DATE d FROM act) GROUP BY s_app_version)) AS install_date_gaps
 """)
-
+# Display integrity2 metrics.
 print(integrity2.to_string(index=False))
+# Save integrity2 metrics.
 M["integrity2"] = integrity2.iloc[0].astype(int).to_dict()
 
+# Check extract-day cohort completeness.
 extract_day = q(f"""
     SELECT SUM(i_active_users) FILTER (WHERE d_install_date = DATE '{EXTRACT}')                AS d0_last_day,
            SUM(i_active_users) FILTER (WHERE d_install_date = DATE '{EXTRACT}' - INTERVAL 1 DAY) AS d0_prev_day
     FROM act WHERE i_cohort_groups = 0 AND {V2}
 """)
+
+# Display extract-day completeness check.
 print("extract day completeness check (a mid day extract would halve the last cohort):")
 print(extract_day.to_string(index=False))
+
+# Save extract-day completeness metrics.
 M["extract_day_check"] = extract_day.iloc[0].astype(int).to_dict()
 
 quirk = q("""
+    -- Check for anomalous cells where summed LEVEL playtime exceeds SESSION playtime.
     WITH p AS (SELECT d_install_date, s_app_version, s_country, s_acquisition_network,
                       s_installing_pckg_group, i_cohort_groups, SUM(f_play_time) AS pt
                FROM prog GROUP BY ALL)
@@ -198,7 +205,8 @@ The real issues in this dataset are STRUCTURAL (labels and censoring).""")
 # 2. Version forensics: the 11.0.1 label cannot be trusted.
 # --------------------------------------------------------------------------- #
 rule("2. DATA QUALITY GATE: the 11.0.1 label")
-
+# Profile version 11.0.1 before excluding or merging it.
+# Profile 11.0.1 rollout volume by month.
 v1101 = q("""
     SELECT strftime(d_install_date, '%Y-%m') AS ym,
            SUM(i_active_users) FILTER (WHERE i_cohort_groups = 0) AS d0_users
@@ -206,6 +214,7 @@ v1101 = q("""
 """)
 print(v1101.to_string(index=False))
 
+# Compare D1 retention and Level 7 completion across builds.
 v1101_profile = q(f"""
     SELECT s_app_version,
       ROUND(100.0 * SUM(i_active_users) FILTER (WHERE i_cohort_groups = 1 AND d_install_date <= DATE '{EXTRACT}' - INTERVAL 1 DAY)
@@ -214,10 +223,12 @@ v1101_profile = q(f"""
          FROM prog p WHERE p.s_app_version = act.s_app_version AND i_level = 7)          AS l7_completion
     FROM act GROUP BY 1 ORDER BY 1
 """)
+
 print(v1101_profile.to_string(index=False))
 M["v1101"] = {"monthly_d0": v1101.astype(str).to_dict("records"),
               "profile_vs_builds": v1101_profile.astype(str).to_dict("records")}
 
+# 11.0 first installs on 15 Apr, yet 11.0.1 carries installs back to February.
 print(f"""
 11.0 first installs on {WIN_START}, yet 11.0.1 carries installs back to February.
 A patch cannot predate its parent, so the label is untrustworthy. It is 767 day 0
@@ -232,6 +243,7 @@ it into 11.0 would be a guess; silently dropping it would hide a pipeline defect
 # --------------------------------------------------------------------------- #
 rule("3. RETENTION, 10.2 vs 11.0 (worldwide)")
 
+# Baseline retention using all cohorts (for comparison only).
 naive = q(f"""
     SELECT s_app_version,
       ROUND(100.0 * SUM(i_active_users) FILTER (WHERE i_cohort_groups = 1) / SUM(i_active_users) FILTER (WHERE i_cohort_groups = 0), 2) AS d1,
@@ -243,6 +255,7 @@ print("NAIVE pooled, all cohorts, no maturity gate (do NOT ship this):")
 print(naive.to_string(index=False))
 M["retention_naive"] = naive.to_dict("records")
 
+# Compute retention using matched, D7-mature cohorts: overlap (WIN_START → WIN_END).
 curve = q(f"""
     WITH base AS (SELECT * FROM act WHERE {V2} AND {WIN}),
     d0 AS (SELECT s_app_version, SUM(i_active_users) AS d0 FROM base WHERE i_cohort_groups = 0 GROUP BY 1)
@@ -256,6 +269,8 @@ print(f"\nHEADLINE, matched install window {WIN_START}..{WIN_END} "
 print(curve.to_string(index=False))
 M["retention_curve"] = curve.to_dict("records")
 
+# Recompute retention over the full history with maturity gating.
+# Extract date = 2026-05-03
 gate = q(f"""
     SELECT s_app_version,
       ROUND(100.0 * SUM(i_active_users) FILTER (WHERE i_cohort_groups = 1 AND d_install_date <= DATE '{EXTRACT}' - INTERVAL 1 DAY)
@@ -270,6 +285,7 @@ print("\nROBUSTNESS, per day maturity gate on full 90 day history (same verdict)
 print(gate.to_string(index=False))
 M["retention_maturity_gate"] = gate.to_dict("records")
 
+# Per cohort date D1 spread inside the window (no overlap between builds, and the unweighted mean agrees with the pooled read, so no big cohort drives it).
 spread = q(f"""
     WITH c AS (
       SELECT s_app_version, d_install_date,
@@ -287,29 +303,39 @@ print("and the unweighted mean agrees with the pooled read, so no big cohort dri
 print(spread.to_string(index=False))
 M["retention_d1_spread"] = spread.to_dict("records")
 
+# Extract headline retention metrics.
 hl = {r["version"]: {d: float(curve[(curve.version == r["version"]) & (curve.cohort_day == n)].retention_pct.iloc[0])
                      for d, n in (("D1", 1), ("D3", 3), ("D7", 7))}
       for r in ({"version": "10.2"}, {"version": "11.0"})}
+
+# Compute absolute and relative retention gaps.
 gaps = {d: round(hl["10.2"][d] - hl["11.0"][d], 1) for d in ("D1", "D3", "D7")}
 rel = {d: round(100 * (hl["11.0"][d] - hl["10.2"][d]) / hl["10.2"][d]) for d in ("D1", "D3", "D7")}
+
+# Save headline retention summary.
 M["retention_headline"] = {"v10_2": hl["10.2"], "v11_0": hl["11.0"], "abs_gap_pts": gaps, "rel_change_pct": rel}
 print(f"\nHeadline: D1 {hl['10.2']['D1']} vs {hl['11.0']['D1']} ({rel['D1']}%), "
       f"D3 {hl['10.2']['D3']} vs {hl['11.0']['D3']} ({rel['D3']}%), "
       f"D7 {hl['10.2']['D7']} vs {hl['11.0']['D7']} ({rel['D7']}%).")
 
+# Two-Proportion Z-Test: two proportions (such as retention rates) is statistically significant or simply due to random sampling
+# z = (p1 - p2) / sqrt(p1 * (1 - p1) / n1 + p2 * (1 - p2) / n2)
 def ztest(x1, n1, x2, n2):
     p1, p2, pp = x1 / n1, x2 / n2, (x1 + x2) / (n1 + n2)
     return round((p1 - p2) / math.sqrt(pp * (1 - pp) * (1 / n1 + 1 / n2)), 1)
 
+# Compute z-scores for D1, D3, and D7.
 zsc = {}
 for d, n in (("D1", 1), ("D3", 3), ("D7", 7)):
     c1 = curve[(curve.version == "10.2") & (curve.cohort_day == n)].iloc[0]
     c2 = curve[(curve.version == "11.0") & (curve.cohort_day == n)].iloc[0]
     zsc[d] = ztest(c1.active_users, c1.cohort_size, c2.active_users, c2.cohort_size)
 M["retention_z_scores"] = zsc
+# A larger absolute Z-score means the observed difference is much larger than what random sampling would normally produce.
 print(f"Two proportion z tests: D1 z = {zsc['D1']}, D3 z = {zsc['D3']}, D7 z = {zsc['D7']}."
       "  The gap is not sampling noise.")
 
+# Compare the D1 retention gap by shared install date.
 gap_dates = q(f"""
     WITH c AS (SELECT s_app_version v, d_install_date::DATE d,
                  SUM(i_active_users) FILTER (WHERE i_cohort_groups = 0) d0,
@@ -319,8 +345,14 @@ gap_dates = q(f"""
                            - MAX(CASE WHEN v = '10.2' THEN d1 * 1.0 / d0 END)), 1) AS d1_gap_pts
     FROM c GROUP BY 1 ORDER BY 1
 """)
+
+# Count install dates where 11.0 underperforms 10.2.
 neg = int((gap_dates.d1_gap_pts < 0).sum())
+
+# Save D1 gap by install date.
 M["d1_gap_by_install_date"] = gap_dates.astype(str).to_dict("records")
+
+# Display D1 gap by install date.
 print(f"D1 gap by shared install date: negative on {neg} of {len(gap_dates)} dates "
       f"(range {gap_dates.d1_gap_pts.min()} to {gap_dates.d1_gap_pts.max()} pts).")
 
@@ -329,6 +361,7 @@ print(f"D1 gap by shared install date: negative on {neg} of {len(gap_dates)} dat
 # --------------------------------------------------------------------------- #
 rule("4. MIX CHECK: is the pooled worldwide comparison fair?")
 
+# Compare user mix across versions.
 mix = q(f"""
     WITH d0 AS (
       SELECT s_app_version, dim, val, SUM(u) AS u FROM (
@@ -361,16 +394,22 @@ print("The rollout split is clean, so the pooled comparison is valid. Checked, n
 # --------------------------------------------------------------------------- #
 rule("5. LEVEL FUNNEL: where does 11.0 break?")
 
+# Compare level completion and retry behavior across versions.
 funnel = q(f"""
     SELECT i_level,
+      -- Level completion rate: the ratio of level completions to level starts.
       ROUND(100.0 * SUM(i_level_completed) FILTER (WHERE s_app_version = '10.2')
                   / SUM(i_level_started)   FILTER (WHERE s_app_version = '10.2'), 1) AS comp_10_2,
       ROUND(100.0 * SUM(i_level_completed) FILTER (WHERE s_app_version = '11.0')
                   / SUM(i_level_started)   FILTER (WHERE s_app_version = '11.0'), 1) AS comp_11_0,
+
+      -- Level attempt rate: the ratio of level starts to users.
       ROUND(1.0 * SUM(i_level_started) FILTER (WHERE s_app_version = '10.2')
                 / SUM(i_users)         FILTER (WHERE s_app_version = '10.2'), 2)     AS att_10_2,
       ROUND(1.0 * SUM(i_level_started) FILTER (WHERE s_app_version = '11.0')
                 / SUM(i_users)         FILTER (WHERE s_app_version = '11.0'), 2)     AS att_11_0,
+      
+      -- Level starts: the number of level starts for 11.0.
       SUM(i_level_started) FILTER (WHERE s_app_version = '11.0')                     AS starts_11_0
     FROM prog WHERE {V2} AND {WIN} GROUP BY 1 ORDER BY 1
 """)
@@ -378,6 +417,7 @@ funnel["delta_pts"] = (funnel.comp_11_0 - funnel.comp_10_2).round(1)
 print(funnel.to_string(index=False))
 M["funnel"] = funnel.to_dict("records")
 
+# Analyze playtime around the suspected level.
 l7_time = q(f"""
     SELECT i_level, s_app_version,
            ROUND(SUM(f_play_time) / SUM(i_level_started), 0) AS sec_per_attempt,
@@ -411,6 +451,7 @@ print("\nLevel 7 completion by 11.0 install date (broken from the FIRST cohort, 
 print(l7_dates.to_string(index=False))
 M["l7_by_install_date"] = l7_dates.astype(str).to_dict("records")
 
+# Estimate level reach relative to Level 1 users.
 reach = q(f"""
     WITH u AS (SELECT s_app_version, i_level, SUM(i_users) AS u FROM prog
                WHERE {V2} AND {WIN} GROUP BY 1, 2)
@@ -426,6 +467,7 @@ print("i_users can count a player on several cohort days):")
 print(reach.to_string(index=False))
 M["reach"] = reach.to_dict("records")
 
+# Quantify global completion drift and the Level 7 break.
 drift = {
     "levels_1_6_mean_delta_pts": round(float((funnel[funnel.i_level.between(1, 6)].comp_11_0
                                               - funnel[funnel.i_level.between(1, 6)].comp_10_2).mean()), 1),
@@ -441,6 +483,7 @@ levels 8..24 average {drift['levels_8_24_mean_delta_pts']} pts) plus ONE catastr
 level 7 ({drift['level_7_delta_pts']} pts). Levels 25..30 carry {drift['tail_25_30_starts_11_0']} total 11.0 starts,
 too thin for any claim; deltas there are suppressed as noise.""")
 
+# Check for launch crashes using zero-playtime active users.
 crash = q(f"""
     SELECT s_app_version,
            SUM(CASE WHEN f_playtime <= 0 AND i_active_users > 0 THEN i_active_users ELSE 0 END) AS actives_zero_playtime
@@ -450,6 +493,7 @@ M["crash_check"] = crash.to_dict("records")
 print("Crash on open check: active users with zero playtime = "
       f"{int(crash.actives_zero_playtime.sum())} in both builds combined. Nobody crashes out at launch.")
 
+# Compare Level 23 starts and completions between versions.
 l23 = q(f"""
     SELECT s_app_version, SUM(i_level_started) AS st, SUM(i_level_completed) AS co
     FROM prog WHERE {V2} AND {WIN} AND i_level = 23 GROUP BY 1 ORDER BY 1
